@@ -1,3 +1,5 @@
+*webapi30-application.yaml
+*.env
 Makefile
 WebAPIConfig/
 *application.properties
