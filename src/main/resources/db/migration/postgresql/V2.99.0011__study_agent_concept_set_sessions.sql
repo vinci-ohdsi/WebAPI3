@@ -4,7 +4,7 @@
 CREATE TABLE ${ohdsiSchema}.study_agent_concept_set_session (
     session_id UUID PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES ${ohdsiSchema}.sec_user(id),
-    concept_set_id INTEGER NULL REFERENCES ${ohdsiSchema}.concept_set(id),
+    concept_set_id INTEGER NULL REFERENCES ${ohdsiSchema}.concept_set(concept_set_id),
     state VARCHAR(64) NOT NULL,
     narrative TEXT NOT NULL,
     ui_context TEXT NOT NULL,
