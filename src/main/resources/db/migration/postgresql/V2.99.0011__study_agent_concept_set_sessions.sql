@@ -38,7 +38,7 @@ CREATE INDEX idx_study_agent_concept_set_review_session
     ON ${ohdsiSchema}.study_agent_concept_set_review (session_id, revision DESC);
 
 INSERT INTO ${ohdsiSchema}.sec_permission (id, value, description)
-SELECT nextval('${ohdsiSchema}.sec_permission_id_seq'),
+SELECT nextval('${ohdsiSchema}.sec_permission_sequence'),
        'study-agent:concept-set-assist',
        'Use the Study Agent concept-set authoring assistant'
 WHERE NOT EXISTS (
