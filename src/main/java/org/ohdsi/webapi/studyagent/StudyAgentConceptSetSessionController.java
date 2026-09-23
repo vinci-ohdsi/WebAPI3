@@ -349,10 +349,13 @@ public class StudyAgentConceptSetSessionController {
   private Map<String, Object> latestConceptSetProvenance(int conceptSetId) {
     try {
       Map<String, Object> session = jdbcTemplate.queryForMap("""
-          select narrative, assistant_state, review_revision, last_active_at
-          from %s where concept_set_id=? and user_id=? and archived_at is null
-          order by last_active_at desc limit 1
-          """.formatted(conceptSetSessionTable), conceptSetId,
+          select s.narrative, s.assistant_state, r.revision as review_revision, s.last_active_at, r.reviewed_expression
+          from %s s join %s r on r.session_id=s.session_id
+              and r.expression_checksum=s.approved_expression_checksum
+          where s.concept_set_id=? and s.user_id=? and s.archived_at is null
+              and s.approved_expression_checksum is not null
+          order by s.last_active_at desc, r.revision desc limit 1
+          """.formatted(conceptSetSessionTable, conceptSetReviewTable), conceptSetId,
           authorizationService.getAuthenticatedPrincipal().getUserId());
       Map<String, Object> result = new LinkedHashMap<>();
       result.put("goal", String.valueOf(session.get("narrative")));
@@ -360,6 +363,17 @@ public class StudyAgentConceptSetSessionController {
       result.put("last_active_at", String.valueOf(session.get("last_active_at")));
       Map<String, Object> dialogue = readObject(session.get("assistant_state"));
       if (dialogue.get("answer") != null) result.put("last_assistant_summary", String.valueOf(dialogue.get("answer")));
+      try {
+        String schema = conceptSetSessionTable.substring(0, conceptSetSessionTable.indexOf('.'));
+        List<Map<String, Object>> persistedItems = jdbcTemplate.queryForList("""
+            select concept_id, is_excluded, include_descendants, include_mapped
+            from %s.concept_set_item where concept_set_id=?
+            """.formatted(schema), conceptSetId);
+        result.put("matches_current_expression", expressionPolicies(String.valueOf(session.get("reviewed_expression")))
+            .equals(persistedPolicies(persistedItems)));
+      } catch (Exception ignored) {
+        result.put("matches_current_expression", null);
+      }
       return result;
     } catch (EmptyResultDataAccessException ignored) {
       return Map.of();
