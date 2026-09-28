@@ -108,7 +108,11 @@ public class StudyAgentConceptSetSessionController {
           "interpreting", message, contextJson, "{}", Timestamp.from(now), Timestamp.from(now));
       recordDialogueMessage(sessionId, "user", message, null);
     });
-    Map<String, Object> response = requestDialogue(sessionId, message, context, "strategy");
+    // Send the normalized context that includes any saved-set provenance and
+    // the bounded expression profile supplied by Atlas. The initial dialogue
+    // must be able to distinguish a few policy rows from a large resolved
+    // Included extension without receiving the full extension itself.
+    Map<String, Object> response = requestDialogue(sessionId, message, contextMap, "strategy");
     response.put("narrative", message);
     return response;
   }

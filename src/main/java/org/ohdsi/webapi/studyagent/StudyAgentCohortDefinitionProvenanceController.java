@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import org.ohdsi.analysis.Utils;
 import org.ohdsi.circe.cohortdefinition.CohortExpression;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import org.ohdsi.webapi.security.authz.AuthorizationService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -15,6 +16,7 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
@@ -106,6 +108,78 @@ public class StudyAgentCohortDefinitionProvenanceController {
     } catch (Exception ex) {
       throw new ResponseStatusException(HttpStatus.CONFLICT, "Unable to review cohort definition");
     }
+  }
+
+  /**
+   * Continues a refinement discussion with compact, persisted cohort context.
+   * The returned guidance is advisory; Atlas remains the only editor and saver.
+   */
+  @PostMapping("/{cohortDefinitionId}/review-dialogue")
+  @PreAuthorize("isPermitted('study-agent:cohort-definition-assist') and (isOwner(#cohortDefinitionId, COHORT_DEFINITION) or isPermitted('read:cohort-definition') or hasEntityAccess(#cohortDefinitionId, COHORT_DEFINITION, READ))")
+  public Map<String, Object> reviewDialogue(@PathVariable Integer cohortDefinitionId, @RequestBody Map<String, Object> request) {
+    if (!enabled) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    String message = request.get("message") == null ? "" : String.valueOf(request.get("message")).trim();
+    if (cohortDefinitionId == null || cohortDefinitionId <= 0 || message.isEmpty() || message.length() > 2000) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid cohort refinement dialogue request");
+    }
+    try {
+      String expression = jdbcTemplate.queryForObject(
+          "select expression from " + sessionTable.replace("study_agent_cohort_definition_session", "cohort_definition_details") + " where id=?",
+          String.class, cohortDefinitionId);
+      @SuppressWarnings("unchecked")
+      Map<String, Object> cohort = objectMapper.readValue(expression, Map.class);
+      Map<String, Object> provenance = reviewService.findOwnedProvenance(
+          reviewTable, sessionTable, cohortDefinitionId, authorizationService.getAuthenticatedPrincipal().getUserId());
+      Map<String, Object> context = new LinkedHashMap<>();
+      context.put("cohort_definition_id", cohortDefinitionId);
+      context.put("cohort_summary", cohortSummary(cohort));
+      context.put("interaction_profile", Map.of(
+          "manual_atlas_editing", true,
+          "automatic_expression_changes", false,
+          "normal_save_and_version_history", true,
+          "current_review_is_advisory", true));
+      if (provenance != null) {
+        context.put("original_narrative", provenance.get("narrative"));
+        context.put("reviewed_expression_matches_current", sameExpression(provenance.get("reviewed_expression"), expression));
+      }
+      Map<String, Object> response = acpClient.post("/flows/workflow_context_dialogue", Map.of(
+          "user_prompt", message,
+          "study_intent", provenance == null ? "" : String.valueOf(provenance.get("narrative")),
+          "workflow_type", "atlas_cohort_definition",
+          "current_step", "phenotype_review",
+          "current_role", "cohort_definition_refinement",
+          "current_context", context));
+      return Map.of("cohort_definition_id", cohortDefinitionId, "dialogue", normalizeDialogue(response));
+    } catch (EmptyResultDataAccessException ex) {
+      throw new ResponseStatusException(HttpStatus.NOT_FOUND, "cohort definition expression not found");
+    } catch (ResponseStatusException ex) {
+      throw ex;
+    } catch (Exception ex) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "Unable to continue cohort refinement dialogue");
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private Map<String, Object> cohortSummary(Map<String, Object> cohort) {
+    Map<String, Object> summary = new LinkedHashMap<>();
+    summary.put("concept_set_count", listSize(cohort.get("ConceptSets")));
+    summary.put("inclusion_rule_count", listSize(cohort.get("InclusionRules")));
+    Object primary = cohort.get("PrimaryCriteria");
+    summary.put("entry_criteria_count", primary instanceof Map<?, ?> map ? listSize(map.get("CriteriaList")) : 0);
+    summary.put("has_censoring_criteria", listSize(cohort.get("CensoringCriteria")) > 0);
+    return summary;
+  }
+
+  private int listSize(Object value) {
+    return value instanceof List<?> list ? list.size() : 0;
+  }
+
+  @SuppressWarnings("unchecked")
+  private Map<String, Object> normalizeDialogue(Map<String, Object> response) {
+    Object dialogue = response.get("dialogue");
+    if (dialogue instanceof Map<?, ?> map) return (Map<String, Object>) map;
+    Map<String, Object> fromContent = parseCritiqueContent(response.get("content"));
+    return fromContent == null ? response : fromContent;
   }
 
   /** ACP can return a critique directly or beneath standard transport/tool wrappers. */
