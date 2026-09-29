@@ -233,6 +233,88 @@ public class StudyAgentConceptSetSessionController {
   }
 
   /**
+   * Revalidates explicit browser-staged candidate policies against the durable
+   * candidate slice of a prior bounded proposal. This is review-only: it does
+   * not modify Selected or retrieve additional vocabulary concepts.
+   */
+  @PostMapping("/{sessionId}/proposal/review")
+  @PreAuthorize("isPermitted('study-agent:concept-set-assist')")
+  public Map<String, Object> reviewProposalPolicies(
+      @PathVariable String sessionId, @RequestBody Map<String, Object> requestBody) {
+    UUID parsedSessionId;
+    try { parsedSessionId = UUID.fromString(sessionId); }
+    catch (IllegalArgumentException ex) { throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid session identifier"); }
+    Object sourceRevisionValue = requestBody.get("source_review_revision");
+    if (!(sourceRevisionValue instanceof Number)) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "source review revision is required");
+    }
+    Object reviewedItemsValue = requestBody.get("reviewed_items");
+    if (!(reviewedItemsValue instanceof List<?> reviewedItems) || reviewedItems.isEmpty() || reviewedItems.size() > 100) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "one to one hundred reviewed policy rows are required");
+    }
+    for (Object item : reviewedItems) {
+      if (!(item instanceof Map<?, ?>)) {
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid reviewed policy row");
+      }
+    }
+    int sourceRevision = ((Number) sourceRevisionValue).intValue();
+    Map<String, Object> sourceReview;
+    try {
+      sourceReview = jdbcTemplate.queryForMap("""
+          select r.review_manifest, s.narrative, s.ui_context, s.concept_set_id
+          from %s r join %s s on s.session_id=r.session_id
+          where r.session_id=? and r.revision=? and s.user_id=? and s.archived_at is null
+          """.formatted(conceptSetReviewTable, conceptSetSessionTable), parsedSessionId, sourceRevision,
+          authorizationService.getAuthenticatedPrincipal().getUserId());
+    } catch (EmptyResultDataAccessException ex) {
+      throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Study Agent proposal review not found");
+    }
+    Map<String, Object> sourceManifest = readObject(sourceReview.get("review_manifest"));
+    Object rawCandidates = sourceManifest.get("candidates");
+    if (!(rawCandidates instanceof List<?> candidates) || candidates.isEmpty()) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "Study Agent proposal has no durable candidate slice");
+    }
+    Map<String, Object> provenance = sourceManifest.get("candidate_provenance") instanceof Map<?, ?> value
+        ? new LinkedHashMap<>((Map<String, Object>) value) : Map.of();
+    String targetDomain = String.valueOf(provenance.getOrDefault("target_domain", "")).trim();
+    if (targetDomain.isEmpty() || !targetDomain.matches("[A-Za-z ]{1,80}")) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "Study Agent proposal has no declared target domain");
+    }
+    if (acpBaseUrl.isBlank()) throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Study Agent unavailable");
+    try {
+      Map<String, Object> context = readObject(sourceReview.get("ui_context"));
+      Integer existingConceptSetId = numericConceptSetId(sourceReview.get("concept_set_id"));
+      if (existingConceptSetId != null) {
+        context.put("base_expression", savedExpression(existingConceptSetId));
+        context.put("extension_mode", true);
+      }
+      Map<String, Object> payload = new LinkedHashMap<>();
+      payload.put("narrative_statement", String.valueOf(sourceReview.get("narrative")));
+      payload.put("target_domain", targetDomain);
+      payload.put("candidate_snapshot", candidates);
+      payload.put("reviewed_items", reviewedItems);
+      payload.put("atlas_constraints", context);
+      HttpRequest request = HttpRequest.newBuilder(URI.create(acpBaseUrl + "/flows/concept_set_policy_review"))
+          .header("Content-Type", "application/json")
+          .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(payload))).build();
+      HttpResponse<String> response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+      if (response.statusCode() != 200) throw new IllegalStateException("acp_status_" + response.statusCode());
+      @SuppressWarnings("unchecked") Map<String, Object> proposal = objectMapper.readValue(response.body(), Map.class);
+      Integer reviewRevision = persistReviewableProposal(parsedSessionId, proposal);
+      Map<String, Object> result = new LinkedHashMap<>();
+      result.put("session_id", parsedSessionId.toString());
+      result.put("proposal", proposal);
+      result.put("source_review_revision", sourceRevision);
+      if (reviewRevision != null) result.put("review_revision", reviewRevision);
+      return result;
+    } catch (ResponseStatusException ex) {
+      throw ex;
+    } catch (Exception ex) {
+      throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Study Agent policy review unavailable");
+    }
+  }
+
+  /**
    * Explicitly accepts one stored proposal revision for review in Atlas Selected/Included.
    * This does not create or save an Atlas concept set; the browser receives the same
    * server-validated expression and initializes its unsaved draft locally.
@@ -477,11 +559,21 @@ public class StudyAgentConceptSetSessionController {
 
   private Integer persistReviewableProposal(UUID sessionId, Map<String, Object> proposal) throws JsonProcessingException {
     Map<String, Object> validation = proposal.get("validation") instanceof Map<?, ?> value
-        ? new LinkedHashMap<>((Map<String, Object>) value) : Map.of();
+        ? new LinkedHashMap<>((Map<String, Object>) value) : new LinkedHashMap<>();
     Map<String, Object> expression = validation.get("expression") instanceof Map<?, ?> value
         ? new LinkedHashMap<>((Map<String, Object>) value) : Map.of();
-    if (!"passed".equals(validation.get("status")) || !(expression.get("items") instanceof List<?> items) || items.isEmpty()) {
+    boolean hasReviewedExpression = "passed".equals(validation.get("status"))
+        && expression.get("items") instanceof List<?> items && !items.isEmpty();
+    boolean hasCandidateSlice = proposal.get("candidates") instanceof List<?> candidates && !candidates.isEmpty();
+    // A candidate-only proposal is durable review material, not an approved
+    // expression. Persist its exact slice so users can stage explicit policies
+    // later; applyProposal still requires a non-empty passed expression.
+    if (!hasReviewedExpression && !hasCandidateSlice) {
       return null;
+    }
+    if (!hasReviewedExpression) {
+      validation.putIfAbsent("status", "not_requested");
+      expression = Map.of("items", List.of());
     }
     String expressionJson = objectMapper.writeValueAsString(expression);
     String checksum = sha256(expressionJson);
