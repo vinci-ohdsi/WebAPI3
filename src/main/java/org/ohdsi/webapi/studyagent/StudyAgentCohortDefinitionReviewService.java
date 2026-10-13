@@ -26,7 +26,7 @@ public class StudyAgentCohortDefinitionReviewService {
   }
 
   public Map<String, Object> findOwnedSession(String sessionTable, UUID sessionId, Long userId) {
-    try { return jdbc.queryForMap("select narrative, acquisition_route from " + sessionTable + " where session_id=? and user_id=? and archived_at is null", sessionId, userId); }
+    try { return jdbc.queryForMap("select narrative, acquisition_route, assistant_state from " + sessionTable + " where session_id=? and user_id=? and archived_at is null", sessionId, userId); }
     catch (EmptyResultDataAccessException ex) { return null; }
   }
 
@@ -47,8 +47,14 @@ public class StudyAgentCohortDefinitionReviewService {
     }
   }
 
-  public void createSession(String sessionTable, UUID sessionId, Long userId, String route, String narrative) {
-    transaction.executeWithoutResult(status -> jdbc.update("insert into " + sessionTable + " (session_id, user_id, state, acquisition_route, narrative, assistant_state, created_at, last_active_at) values (?, ?, ?, ?, ?, ?, ?, ?)", sessionId, userId, "started", route, narrative, "{}", Timestamp.from(Instant.now()), Timestamp.from(Instant.now())));
+  public void createSession(String sessionTable, UUID sessionId, Long userId, String route, String narrative, Map<String, Object> assistantState) {
+    transaction.executeWithoutResult(status -> {
+      try {
+        jdbc.update("insert into " + sessionTable + " (session_id, user_id, state, acquisition_route, narrative, assistant_state, created_at, last_active_at) values (?, ?, ?, ?, ?, ?, ?, ?)", sessionId, userId, "started", route, narrative, mapper.writeValueAsString(assistantState), Timestamp.from(Instant.now()), Timestamp.from(Instant.now()));
+      } catch (Exception ex) {
+        throw new IllegalStateException("Unable to create Study Agent cohort session", ex);
+      }
+    });
   }
 
   public void updateState(String sessionTable, UUID sessionId, String state, String assistantState) {

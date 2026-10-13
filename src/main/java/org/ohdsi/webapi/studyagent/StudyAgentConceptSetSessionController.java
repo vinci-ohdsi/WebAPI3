@@ -117,6 +117,125 @@ public class StudyAgentConceptSetSessionController {
     return response;
   }
 
+  /**
+   * Registers an already-created, user-owned Atlas concept-set draft as the
+   * review surface for an R phenotype_make_computable session. The caller is
+   * deliberately responsible for creating the normal Atlas asset first: this
+   * controller records review provenance and never creates assets under a
+   * service account or exposes ACP to the R client.
+   */
+  @PostMapping("/external-review")
+  @PreAuthorize("isPermitted('study-agent:concept-set-assist') and (isOwner(#conceptSetId, CONCEPT_SET) or isPermitted('write:conceptset') or hasEntityAccess(#conceptSetId, CONCEPT_SET, WRITE))")
+  public Map<String, Object> createExternalReview(
+      @RequestParam int conceptSetId, @RequestBody Map<String, Object> request) {
+    if (!enabled) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    String narrative = String.valueOf(request.getOrDefault("narrative", "")).trim();
+    String reviewId = String.valueOf(request.getOrDefault("review_id", "")).trim();
+    if (narrative.isEmpty() || narrative.length() > 4000 || reviewId.isEmpty() || reviewId.length() > 160) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "narrative and review_id are required");
+    }
+    Map<String, Object> externalReview = new LinkedHashMap<>();
+    externalReview.put("source", "r_phenotype_make_computable");
+    externalReview.put("review_id", reviewId);
+    copyBoundedExternalReviewField(request, externalReview, "workflow_id", 160);
+    copyBoundedExternalReviewField(request, externalReview, "role_label", 80);
+    copyBoundedExternalReviewField(request, externalReview, "candidate_count", 0);
+    if (request.get("scope") instanceof Map<?, ?> scope) externalReview.put("scope", scope);
+    if (request.get("candidate_summary") instanceof Map<?, ?> summary) externalReview.put("candidate_summary", summary);
+    Map<String, Object> context = new LinkedHashMap<>();
+    context.put("route", "r_phenotype_make_computable");
+    context.put("external_review", externalReview);
+    UUID sessionId = UUID.randomUUID();
+    Instant now = Instant.now();
+    writeInTransaction(() -> jdbcTemplate.update(("""
+        insert into %s
+          (session_id, user_id, concept_set_id, state, narrative, ui_context, assistant_state, created_at, last_active_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """).formatted(conceptSetSessionTable), sessionId,
+        authorizationService.getAuthenticatedPrincipal().getUserId(), conceptSetId,
+        "external_review_pending", narrative, writeJson(context), "{}", Timestamp.from(now), Timestamp.from(now)));
+    return Map.of("session_id", sessionId.toString(), "state", "external_review_pending",
+        "concept_set_id", conceptSetId, "review_id", reviewId);
+  }
+
+  /** Status and immutable accepted snapshot for an R-created Atlas review. */
+  @GetMapping("/external-review/{sessionId}")
+  @PreAuthorize("isPermitted('study-agent:concept-set-assist')")
+  public Map<String, Object> externalReviewStatus(@PathVariable String sessionId) {
+    UUID parsedSessionId = parseSessionId(sessionId);
+    Map<String, Object> session = externalReviewSession(parsedSessionId);
+    Map<String, Object> result = new LinkedHashMap<>();
+    result.put("session_id", parsedSessionId.toString());
+    result.put("state", String.valueOf(session.get("state")));
+    result.put("concept_set_id", session.get("concept_set_id"));
+    Map<String, Object> context = readObject(session.get("ui_context"));
+    if (context.get("external_review") instanceof Map<?, ?> externalReview) result.put("external_review", externalReview);
+    if (!"external_review_accepted".equals(session.get("state"))) return result;
+    Map<String, Object> review = latestReview(parsedSessionId);
+    result.put("review_revision", review.get("revision"));
+    result.put("expression_checksum", review.get("expression_checksum"));
+    result.put("expression", readObject(review.get("reviewed_expression")));
+    result.put("accepted_at", String.valueOf(review.get("approved_at")));
+    return result;
+  }
+
+  /**
+   * Freezes the normal Atlas concept-set expression after the user saves it.
+   * The saved asset remains editable in Atlas, but R resumes only from this
+   * exact review revision and checksum.
+   */
+  @PostMapping("/external-review/{sessionId}/finalize")
+  @PreAuthorize("isPermitted('study-agent:concept-set-assist') and (isOwner(#conceptSetId, CONCEPT_SET) or isPermitted('write:conceptset') or hasEntityAccess(#conceptSetId, CONCEPT_SET, WRITE))")
+  public Map<String, Object> finalizeExternalReview(
+      @PathVariable String sessionId, @RequestParam int conceptSetId) {
+    UUID parsedSessionId = parseSessionId(sessionId);
+    Map<String, Object> session = externalReviewSession(parsedSessionId);
+    if (!Integer.valueOf(conceptSetId).equals(((Number) session.get("concept_set_id")).intValue())) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "external review concept set does not match");
+    }
+    if ("external_review_accepted".equals(session.get("state"))) return acceptedExternalReview(parsedSessionId, conceptSetId);
+    if (!"external_review_pending".equals(session.get("state"))) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "external review cannot be finalized");
+    }
+    try {
+      Map<String, Object> expression = savedExpression(conceptSetId, externalReviewScopeDomain(session));
+      Object rawItems = expression.get("items");
+      if (!(rawItems instanceof List<?> items) || items.isEmpty()) {
+        throw new ResponseStatusException(HttpStatus.CONFLICT, "save at least one concept policy before returning to R");
+      }
+      String expressionJson = objectMapper.writeValueAsString(expression);
+      ConceptSetExpression circeExpression = objectMapper.readValue(expressionJson, ConceptSetExpression.class);
+      String sql = new ConceptSetExpressionQueryBuilder().buildExpressionQuery(circeExpression);
+      if (sql == null || sql.isBlank()) throw new IllegalArgumentException("circe_expression_sql_empty");
+      Map<String, Object> context = readObject(session.get("ui_context"));
+      String manifest = objectMapper.writeValueAsString(Map.of(
+          "source", "r_phenotype_make_computable",
+          "external_review", context.getOrDefault("external_review", Map.of()),
+          "concept_set_id", conceptSetId));
+      String validation = objectMapper.writeValueAsString(Map.of(
+          "status", "passed", "validator", "webapi_java_circe", "validated_at", Instant.now().toString()));
+      String checksum = sha256(expressionJson);
+      Integer revision = transactionTemplate.execute(status -> {
+        Integer nextRevision = jdbcTemplate.queryForObject("select coalesce(max(revision), 0) + 1 from " + conceptSetReviewTable + " where session_id=?", Integer.class, parsedSessionId);
+        jdbcTemplate.update("""
+            insert into %s (session_id, revision, expression_checksum, reviewed_expression, review_manifest, acp_validation, webapi_validation, vocabulary_provenance, approved_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """.formatted(conceptSetReviewTable), parsedSessionId, nextRevision, checksum, expressionJson,
+            manifest, "{\"status\":\"not_applicable\"}", validation, "{}", Timestamp.from(Instant.now()));
+        jdbcTemplate.update("update " + conceptSetSessionTable + " set state=?, review_revision=?, approved_expression_checksum=?, last_active_at=? where session_id=?",
+            "external_review_accepted", nextRevision, checksum, Timestamp.from(Instant.now()), parsedSessionId);
+        return nextRevision;
+      });
+      return Map.of("session_id", parsedSessionId.toString(), "state", "external_review_accepted",
+          "concept_set_id", conceptSetId, "review_revision", revision,
+          "expression_checksum", checksum, "expression", expression);
+    } catch (ResponseStatusException ex) {
+      throw ex;
+    } catch (Exception ex) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "WebAPI could not finalize the reviewed concept-set expression");
+    }
+  }
+
   /** Concise, user-owned provenance for a saved concept set; does not resume a prior dialogue. */
   @GetMapping("/context")
   @PreAuthorize("isPermitted('study-agent:concept-set-assist') and (isOwner(#conceptSetId, CONCEPT_SET) or isPermitted('write:conceptset') or hasEntityAccess(#conceptSetId, CONCEPT_SET, WRITE))")
@@ -466,6 +585,68 @@ public class StudyAgentConceptSetSessionController {
     }
   }
 
+  private UUID parseSessionId(String sessionId) {
+    try {
+      return UUID.fromString(sessionId);
+    } catch (IllegalArgumentException ex) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid session identifier");
+    }
+  }
+
+  private Map<String, Object> externalReviewSession(UUID sessionId) {
+    try {
+      Map<String, Object> session = jdbcTemplate.queryForMap("""
+          select concept_set_id, state, ui_context
+          from %s
+          where session_id=? and user_id=? and archived_at is null
+          """.formatted(conceptSetSessionTable), sessionId,
+          authorizationService.getAuthenticatedPrincipal().getUserId());
+      if (!String.valueOf(session.get("state")).startsWith("external_review_")) {
+        throw new ResponseStatusException(HttpStatus.NOT_FOUND, "external review session not found");
+      }
+      return session;
+    } catch (EmptyResultDataAccessException ex) {
+      throw new ResponseStatusException(HttpStatus.NOT_FOUND, "external review session not found");
+    }
+  }
+
+  private Map<String, Object> latestReview(UUID sessionId) {
+    try {
+      return jdbcTemplate.queryForMap("""
+          select revision, expression_checksum, reviewed_expression, approved_at
+          from %s where session_id=? order by revision desc limit 1
+          """.formatted(conceptSetReviewTable), sessionId);
+    } catch (EmptyResultDataAccessException ex) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "external review has no accepted snapshot");
+    }
+  }
+
+  private Map<String, Object> acceptedExternalReview(UUID sessionId, int conceptSetId) {
+    Map<String, Object> review = latestReview(sessionId);
+    return Map.of("session_id", sessionId.toString(), "state", "external_review_accepted",
+        "concept_set_id", conceptSetId, "review_revision", review.get("revision"),
+        "expression_checksum", review.get("expression_checksum"),
+        "expression", readObject(review.get("reviewed_expression")));
+  }
+
+  private void copyBoundedExternalReviewField(
+      Map<String, Object> request, Map<String, Object> destination, String name, int maxLength) {
+    Object value = request.get(name);
+    if (value == null) return;
+    if (maxLength == 0) {
+      if (!(value instanceof Number number) || number.intValue() < 0 || number.intValue() > 5000) {
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid external review candidate_count");
+      }
+      destination.put(name, number.intValue());
+      return;
+    }
+    String text = String.valueOf(value).trim();
+    if (text.length() > maxLength) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid external review " + name);
+    }
+    if (!text.isEmpty()) destination.put(name, text);
+  }
+
   private Integer numericConceptSetId(Object value) {
     if (value instanceof Number number && number.intValue() > 0) return number.intValue();
     try {
@@ -477,6 +658,10 @@ public class StudyAgentConceptSetSessionController {
   }
 
   private Map<String, Object> savedExpression(int conceptSetId) {
+    return savedExpression(conceptSetId, "");
+  }
+
+  private Map<String, Object> savedExpression(int conceptSetId, String intendedDomain) {
     String schema = conceptSetSessionTable.substring(0, conceptSetSessionTable.indexOf('.'));
     List<Map<String, Object>> persistedItems = jdbcTemplate.queryForList("""
         select concept_id, is_excluded, include_descendants, include_mapped
@@ -484,13 +669,33 @@ public class StudyAgentConceptSetSessionController {
         """.formatted(schema), conceptSetId);
     List<Map<String, Object>> items = new java.util.ArrayList<>();
     for (Map<String, Object> item : persistedItems) {
+      Map<String, Object> concept = new LinkedHashMap<>();
+      concept.put("CONCEPT_ID", ((Number) item.get("concept_id")).intValue());
+      if (intendedDomain != null && !intendedDomain.isBlank()) concept.put("DOMAIN_ID", intendedDomain);
       items.add(Map.of(
-          "concept", Map.of("CONCEPT_ID", ((Number) item.get("concept_id")).intValue()),
+          "concept", concept,
           "isExcluded", flag(item.get("is_excluded")) == 1,
           "includeDescendants", flag(item.get("include_descendants")) == 1,
           "includeMapped", flag(item.get("include_mapped")) == 1));
     }
     return Map.of("items", items);
+  }
+
+  /** The R handoff has one review-gated criterion domain; retain it in the immutable snapshot. */
+  private String externalReviewScopeDomain(Map<String, Object> session) {
+    Map<String, Object> context = readObject(session.get("ui_context"));
+    if (!(context.get("external_review") instanceof Map<?, ?> externalReview)
+        || !(externalReview.get("scope") instanceof Map<?, ?> scope)
+        || !(scope.get("criterion_domains") instanceof Map<?, ?> domains)) return "";
+    String domain = "";
+    for (Object value : domains.values()) {
+      String candidate = String.valueOf(value == null ? "" : value).trim();
+      if (candidate.isBlank()) continue;
+      if (!candidate.matches("[A-Za-z][A-Za-z ]{0,79}")) return "";
+      if (domain.isBlank()) domain = candidate;
+      else if (!domain.equalsIgnoreCase(candidate)) return "";
+    }
+    return domain;
   }
 
   private List<String> expressionPolicies(String expressionJson) throws JsonProcessingException {

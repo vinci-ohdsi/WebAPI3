@@ -83,8 +83,13 @@ public class StudyAgentCohortDefinitionSessionController {
     if (narrative.isEmpty() || narrative.length() > 4000 || !List.of("ai_search", "library", "make_computable").contains(route)) {
       throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid Study Agent cohort request");
     }
+    Map<String, Object> sourceContext = map(request.get("source_context"));
+    if (json(sourceContext).length() > 12000) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "source context is too large");
+    }
     UUID sessionId = UUID.randomUUID();
-    reviewService.createSession(sessionTable, sessionId, authorizationService.getAuthenticatedPrincipal().getUserId(), route, narrative);
+    Map<String, Object> initialState = sourceContext.isEmpty() ? Map.of() : Map.of("source_context", sourceContext);
+    reviewService.createSession(sessionTable, sessionId, authorizationService.getAuthenticatedPrincipal().getUserId(), route, narrative, initialState);
     return Map.of("session_id", sessionId.toString(), "route", route, "narrative", narrative, "state", "started");
   }
 
@@ -183,6 +188,31 @@ public class StudyAgentCohortDefinitionSessionController {
   }
 
   /**
+   * Returns bounded, review-only source evidence for a phenotype that needs conversion.
+   * The browser cannot use this response to create a cohort; it must still select
+   * a primary-index starting point and complete normal scope and policy review.
+   */
+  @PostMapping("/{sessionId}/phenotypes/{phenotypeId}/conversion-prepare")
+  @PreAuthorize("isPermitted('study-agent:cohort-definition-assist')")
+  public Map<String, Object> prepareConversion(
+      @PathVariable String sessionId, @PathVariable String phenotypeId,
+      @RequestBody(required = false) Map<String, Object> request) {
+    ownedSession(sessionId, null);
+    String cleanedId = string(phenotypeId);
+    if (cleanedId.isEmpty() || cleanedId.length() > 256) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid phenotype identifier");
+    }
+    Map<String, Object> context = request == null ? Map.of() : map(request.get("recommendation_context"));
+    Map<String, Object> response = acpClient.post("/flows/phenotype_conversion_prepare", Map.of(
+        "phenotype_id", cleanedId, "recommendation_context", context,
+        "check_vocabulary_database", true));
+    if (!"ok".equals(response.get("status"))) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "Source phenotype evidence is unavailable for conversion review");
+    }
+    return Map.of("session_id", sessionId, "conversion", response);
+  }
+
+  /**
    * Starts (or advances) the existing review-gated narrative-to-computable flow.
    * This endpoint intentionally forwards only typed review inputs and never
    * turns a clarification response into an executable draft.
@@ -201,6 +231,11 @@ public class StudyAgentCohortDefinitionSessionController {
     payload.put("candidate_limit", request.get("candidate_limit") instanceof Number number ? number.intValue() : 20);
     payload.put("concept_sets", request.get("concept_sets") instanceof List<?> ? request.get("concept_sets") : List.of());
     Map<String, Object> response = acpClient.post("/flows/phenotype_make_computable", payload);
+    Map<String, Object> sourceContext = sourceContext(session);
+    if (!sourceContext.isEmpty()) {
+      response = new LinkedHashMap<>(response);
+      response.put("source_context", sourceContext);
+    }
     UUID parsed = parseSessionId(sessionId);
     Map<String, Object> requestedScope = map(request.get("scope"));
     boolean scopeConfirmed = Boolean.TRUE.equals(request.get("confirmed_scope"))
@@ -213,7 +248,8 @@ public class StudyAgentCohortDefinitionSessionController {
     } else {
       String state = "needs_clarification".equals(response.get("status")) ? "needs_scope_clarification"
           : "needs_concept_review".equals(response.get("status")) ? "needs_concept_review" : "make_computable_response";
-      writeInTransaction(() -> updateState(parsed, state, response));
+      Map<String, Object> responseToPersist = response;
+      writeInTransaction(() -> updateState(parsed, state, responseToPersist));
       if (scopeConfirmed && "needs_concept_review".equals(state)) {
         boolean hasCandidateSlice = response.get("concept_candidates") instanceof List<?> candidates && !candidates.isEmpty();
         specificationState = hasCandidateSlice ? state : "needs_candidate_retrieval";
@@ -496,6 +532,20 @@ public class StudyAgentCohortDefinitionSessionController {
     if (session == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Study Agent cohort session not found");
     if (expectedRoute != null && !expectedRoute.equals(session.get("acquisition_route"))) throw new ResponseStatusException(HttpStatus.CONFLICT, "Study Agent session route does not allow this action");
     return session;
+  }
+
+  @SuppressWarnings("unchecked")
+  private Map<String, Object> sourceContext(Map<String, Object> session) {
+    try {
+      Object raw = session.get("assistant_state");
+      if (raw instanceof Map<?, ?> value) return map(value).containsKey("source_context") ? map(map(value).get("source_context")) : Map.of();
+      if (raw == null || string(raw).isEmpty()) return Map.of();
+      Map<String, Object> state = objectMapper.readValue(string(raw), Map.class);
+      return map(state.get("source_context"));
+    } catch (Exception ex) {
+      LOGGER.warn("Ignoring unreadable Study Agent source context");
+      return Map.of();
+    }
   }
 
   private void updateState(UUID sessionId, String state, Object assistantState) {
