@@ -51,6 +51,17 @@
     <outputDirectory>${basedir}/target/classes</outputDirectory>
     <testOutputDirectory>${basedir}/target/test-classes</testOutputDirectory>
     <plugins>
+      <!--
+        The project packages as a WAR by default. Pin the WAR plugin here,
+        not only in the optional `war` profile: Maven's implicit 2.2 plugin
+        is incompatible with Java 21 (it reflectively accesses
+        Properties.defaults).
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-war-plugin</artifactId>
+        <version>3.4.0</version>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
