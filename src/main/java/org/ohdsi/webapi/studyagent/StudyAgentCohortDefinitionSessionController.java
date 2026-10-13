@@ -213,6 +213,49 @@ public class StudyAgentCohortDefinitionSessionController {
   }
 
   /**
+   * Returns contextual, advisory-only guidance while a cohort is being authored.
+   * It cannot alter the session, scope, concept policy, or Atlas cohort draft.
+   */
+  @PostMapping("/{sessionId}/dialogue")
+  @PreAuthorize("isPermitted('study-agent:cohort-definition-assist')")
+  public Map<String, Object> dialogue(@PathVariable String sessionId, @RequestBody Map<String, Object> request) {
+    Map<String, Object> session = ownedSession(sessionId, null);
+    String message = string(request.get("message"));
+    if (message.isEmpty() || message.length() > 2000) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid cohort authoring dialogue request");
+    }
+    String stage = string(request.get("stage"));
+    if (!List.of("phenotype_review", "scope_clarification", "candidate_review", "logic_review").contains(stage)) {
+      stage = "phenotype_review";
+    }
+    Map<String, Object> clientContext = map(request.get("context"));
+    if (json(clientContext).length() > 8000) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cohort authoring context is too large");
+    }
+    Map<String, Object> context = new LinkedHashMap<>();
+    context.put("acquisition_route", string(session.get("acquisition_route")));
+    context.put("review_gated", true);
+    context.put("automatic_expression_changes", false);
+    context.put("manual_atlas_editing", true);
+    context.put("current_review_is_advisory", true);
+    Map<String, Object> sourceContext = sourceContext(session);
+    if (!sourceContext.isEmpty()) context.put("source_phenotype_reference", sourceContext);
+    if (!clientContext.isEmpty()) context.put("authoring_stage_context", clientContext);
+    Map<String, Object> response = acpClient.post("/flows/workflow_context_dialogue", Map.of(
+        "user_prompt", message,
+        "study_intent", string(session.get("narrative")),
+        "workflow_type", "atlas_cohort_definition",
+        "current_step", "phenotype_review",
+        "current_role", "cohort_definition_author",
+        "current_context", context));
+    Map<String, Object> result = new LinkedHashMap<>();
+    result.put("session_id", sessionId);
+    result.put("stage", stage);
+    result.put("dialogue", map(response.get("dialogue")));
+    return result;
+  }
+
+  /**
    * Starts (or advances) the existing review-gated narrative-to-computable flow.
    * This endpoint intentionally forwards only typed review inputs and never
    * turns a clarification response into an executable draft.
