@@ -140,6 +140,10 @@ public class StudyAgentConceptSetSessionController {
     copyBoundedExternalReviewField(request, externalReview, "workflow_id", 160);
     copyBoundedExternalReviewField(request, externalReview, "role_label", 80);
     copyBoundedExternalReviewField(request, externalReview, "candidate_count", 0);
+    if (request.get("require_item_domain_metadata") instanceof Boolean required) {
+      externalReview.put("require_item_domain_metadata", required);
+    }
+    if (request.get("review_lane") instanceof Map<?, ?> lane) externalReview.put("review_lane", lane);
     if (request.get("scope") instanceof Map<?, ?> scope) externalReview.put("scope", scope);
     if (request.get("candidate_summary") instanceof Map<?, ?> summary) externalReview.put("candidate_summary", summary);
     Map<String, Object> context = new LinkedHashMap<>();
@@ -187,7 +191,8 @@ public class StudyAgentConceptSetSessionController {
   @PostMapping("/external-review/{sessionId}/finalize")
   @PreAuthorize("isPermitted('study-agent:concept-set-assist') and (isOwner(#conceptSetId, CONCEPT_SET) or isPermitted('write:conceptset') or hasEntityAccess(#conceptSetId, CONCEPT_SET, WRITE))")
   public Map<String, Object> finalizeExternalReview(
-      @PathVariable String sessionId, @RequestParam int conceptSetId) {
+      @PathVariable String sessionId, @RequestParam int conceptSetId,
+      @RequestBody(required = false) Map<String, Object> request) {
     UUID parsedSessionId = parseSessionId(sessionId);
     Map<String, Object> session = externalReviewSession(parsedSessionId);
     if (!Integer.valueOf(conceptSetId).equals(((Number) session.get("concept_set_id")).intValue())) {
@@ -198,7 +203,9 @@ public class StudyAgentConceptSetSessionController {
       throw new ResponseStatusException(HttpStatus.CONFLICT, "external review cannot be finalized");
     }
     try {
-      Map<String, Object> expression = savedExpression(conceptSetId, externalReviewScopeDomain(session));
+      String intendedDomain = externalReviewScopeDomain(session);
+      Map<Integer, String> itemDomains = externalReviewItemDomains(session, request, conceptSetId, intendedDomain);
+      Map<String, Object> expression = savedExpression(conceptSetId, intendedDomain, itemDomains);
       Object rawItems = expression.get("items");
       if (!(rawItems instanceof List<?> items) || items.isEmpty()) {
         throw new ResponseStatusException(HttpStatus.CONFLICT, "save at least one concept policy before returning to R");
@@ -662,6 +669,10 @@ public class StudyAgentConceptSetSessionController {
   }
 
   private Map<String, Object> savedExpression(int conceptSetId, String intendedDomain) {
+    return savedExpression(conceptSetId, intendedDomain, Map.of());
+  }
+
+  private Map<String, Object> savedExpression(int conceptSetId, String intendedDomain, Map<Integer, String> itemDomains) {
     String schema = conceptSetSessionTable.substring(0, conceptSetSessionTable.indexOf('.'));
     List<Map<String, Object>> persistedItems = jdbcTemplate.queryForList("""
         select concept_id, is_excluded, include_descendants, include_mapped
@@ -669,9 +680,11 @@ public class StudyAgentConceptSetSessionController {
         """.formatted(schema), conceptSetId);
     List<Map<String, Object>> items = new java.util.ArrayList<>();
     for (Map<String, Object> item : persistedItems) {
+      int conceptId = ((Number) item.get("concept_id")).intValue();
       Map<String, Object> concept = new LinkedHashMap<>();
-      concept.put("CONCEPT_ID", ((Number) item.get("concept_id")).intValue());
-      if (intendedDomain != null && !intendedDomain.isBlank()) concept.put("DOMAIN_ID", intendedDomain);
+      concept.put("CONCEPT_ID", conceptId);
+      String domain = itemDomains.getOrDefault(conceptId, intendedDomain == null ? "" : intendedDomain);
+      if (domain != null && !domain.isBlank()) concept.put("DOMAIN_ID", domain);
       items.add(Map.of(
           "concept", concept,
           "isExcluded", flag(item.get("is_excluded")) == 1,
@@ -679,6 +692,54 @@ public class StudyAgentConceptSetSessionController {
           "includeMapped", flag(item.get("include_mapped")) == 1));
     }
     return Map.of("items", items);
+  }
+
+  /** Validates editor-resolved domains before freezing an R review lane snapshot. */
+  private Map<Integer, String> externalReviewItemDomains(
+      Map<String, Object> session, Map<String, Object> request, int conceptSetId, String intendedDomain) {
+    Map<String, Object> context = readObject(session.get("ui_context"));
+    Map<String, Object> externalReview = context.get("external_review") instanceof Map<?, ?> value
+        ? readObject(value) : Map.of();
+    boolean required = Boolean.TRUE.equals(externalReview.get("require_item_domain_metadata"));
+    Object rawDomains = request == null ? null : request.get("reviewed_item_domains");
+    if (!(rawDomains instanceof List<?> rows)) {
+      if (required) throw new ResponseStatusException(HttpStatus.CONFLICT,
+          "Atlas must provide resolved concept domains before this review lane can be finalized");
+      return Map.of();
+    }
+    Map<Integer, String> domains = new LinkedHashMap<>();
+    for (Object rawRow : rows) {
+      if (!(rawRow instanceof Map<?, ?> row)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "reviewed item domain is invalid");
+      Integer conceptId = numericConceptSetId(row.get("concept_id"));
+      Object rawDomain = row.get("domain");
+      String domain = String.valueOf(rawDomain == null ? "" : rawDomain).trim();
+      if (conceptId == null || domain.isBlank() || !domain.matches("[A-Za-z][A-Za-z ]{0,79}")) {
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "reviewed item concept id and domain are required");
+      }
+      if (!intendedDomain.isBlank() && !intendedDomain.equalsIgnoreCase(domain)) {
+        throw new ResponseStatusException(HttpStatus.CONFLICT,
+            "saved concept domain '" + domain + "' does not match this review lane ('" + intendedDomain + "')");
+      }
+      String existing = domains.putIfAbsent(conceptId, domain);
+      if (existing != null && !existing.equalsIgnoreCase(domain)) {
+        throw new ResponseStatusException(HttpStatus.CONFLICT, "one saved concept has conflicting domain metadata");
+      }
+    }
+    String schema = conceptSetSessionTable.substring(0, conceptSetSessionTable.indexOf('.'));
+    List<Map<String, Object>> persistedItems = jdbcTemplate.queryForList(
+        "select distinct concept_id from " + schema + ".concept_set_item where concept_set_id=?", conceptSetId);
+    if (domains.size() != persistedItems.size()) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT,
+          "Atlas saved concepts do not match the concepts whose domains were reviewed");
+    }
+    for (Map<String, Object> item : persistedItems) {
+      int conceptId = ((Number) item.get("concept_id")).intValue();
+      if (!domains.containsKey(conceptId)) {
+        throw new ResponseStatusException(HttpStatus.CONFLICT,
+            "Atlas saved concepts do not match the concepts whose domains were reviewed");
+      }
+    }
+    return domains;
   }
 
   /** The R handoff has one review-gated criterion domain; retain it in the immutable snapshot. */
