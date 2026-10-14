@@ -93,6 +93,54 @@ public class StudyAgentCohortDefinitionSessionController {
     return Map.of("session_id", sessionId.toString(), "route", route, "narrative", narrative, "state", "started");
   }
 
+  /**
+   * Registers an already validated R phenotype_make_computable artifact as an
+   * ordinary unsaved Atlas cohort draft. This creates no cohort definition:
+   * the current Atlas user must inspect and explicitly save it through the
+   * normal cohort editor. Later Atlas edits never mutate the R workflow.
+   */
+  @PostMapping("/external-r-draft")
+  @PreAuthorize("isPermitted('study-agent:cohort-definition-assist') and isPermitted('create:cohort-definition')")
+  public Map<String, Object> createExternalRDraft(@RequestBody Map<String, Object> request) {
+    requireEnabled();
+    String narrative = string(request.get("narrative"));
+    String roleLabel = string(request.get("role_label"));
+    String reviewId = string(request.get("review_id"));
+    Map<String, Object> expression = map(request.get("expression"));
+    Map<String, Object> technicalValidation = map(request.get("technical_validation"));
+    if (narrative.isEmpty() || narrative.length() > 4000 || roleLabel.length() > 80 || reviewId.length() > 160) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid R cohort draft request");
+    }
+    if (!(expression.get("PrimaryCriteria") instanceof Map<?, ?>) || !(expression.get("ConceptSets") instanceof List<?>)) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "R cohort draft must contain a Circe primary criterion and concept sets");
+    }
+    if (!"passed".equals(string(technicalValidation.get("status")))) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "Only a technically validated R cohort definition can be opened in Atlas");
+    }
+    if (json(expression).length() > 1000000) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "R cohort draft is too large");
+    }
+    Map<String, Object> provenance = new LinkedHashMap<>();
+    provenance.put("source", "r_phenotype_make_computable");
+    provenance.put("role_label", roleLabel);
+    provenance.put("review_id", reviewId);
+    provenance.put("technical_validation", Map.of("status", "passed"));
+    provenance.put("r_artifact_immutable", true);
+    UUID sessionId = UUID.randomUUID();
+    Long userId = authorizationService.getAuthenticatedPrincipal().getUserId();
+    reviewService.createSession(sessionTable, sessionId, userId, "make_computable", narrative,
+        Map.of("source_context", provenance));
+    int revision = reviewService.persist(reviewTable, sessionTable, sessionId,
+        "r_phenotype_make_computable", reviewId.isEmpty() ? null : reviewId,
+        narrative, expression, provenance);
+    return Map.of(
+        "session_id", sessionId.toString(),
+        "review_revision", revision,
+        "name", narrative,
+        "expression_checksum", sha256(json(expression)),
+        "state", "draft_ready");
+  }
+
   @PostMapping("/{sessionId}/recommendations")
   @PreAuthorize("isPermitted('study-agent:cohort-definition-assist')")
   public Map<String, Object> recommendations(@PathVariable String sessionId, @RequestBody(required = false) Map<String, Object> request) {
