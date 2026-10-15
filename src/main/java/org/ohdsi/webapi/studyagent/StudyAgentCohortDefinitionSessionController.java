@@ -288,13 +288,13 @@ public class StudyAgentCohortDefinitionSessionController {
     context.put("manual_atlas_editing", true);
     context.put("current_review_is_advisory", true);
     Map<String, Object> sourceContext = sourceContext(session);
-    if (!sourceContext.isEmpty()) context.put("source_phenotype_reference", sourceContext);
+    if (!sourceContext.isEmpty()) context.put("authoring_context", sourceContext);
     if (!clientContext.isEmpty()) context.put("authoring_stage_context", clientContext);
     Map<String, Object> response = acpClient.post("/flows/workflow_context_dialogue", Map.of(
         "user_prompt", message,
         "study_intent", string(session.get("narrative")),
         "workflow_type", "atlas_cohort_definition",
-        "current_step", "phenotype_review",
+        "current_step", stage,
         "current_role", "cohort_definition_author",
         "current_context", context));
     Map<String, Object> result = new LinkedHashMap<>();
@@ -648,7 +648,26 @@ public class StudyAgentCohortDefinitionSessionController {
   }
 
   private void updateState(UUID sessionId, String state, Object assistantState) {
-    reviewService.updateState(sessionTable, sessionId, state, json(assistantState));
+    Map<String, Object> persisted = assistantState instanceof Map<?, ?>
+        ? new LinkedHashMap<>(map(assistantState)) : new LinkedHashMap<>(Map.of("state_payload", assistantState));
+    Map<String, Object> priorSourceContext = sourceContextForSession(sessionId);
+    if (!priorSourceContext.isEmpty()) persisted.putIfAbsent("source_context", priorSourceContext);
+    reviewService.updateState(sessionTable, sessionId, state, json(persisted));
+  }
+
+  private Map<String, Object> sourceContextForSession(UUID sessionId) {
+    try {
+      String assistantState = jdbcTemplate.queryForObject(
+          "select assistant_state from " + sessionTable + " where session_id=?", String.class, sessionId);
+      if (assistantState == null || assistantState.isBlank()) return Map.of();
+      Map<String, Object> state = objectMapper.readValue(assistantState, Map.class);
+      return map(state.get("source_context"));
+    } catch (EmptyResultDataAccessException ex) {
+      return Map.of();
+    } catch (Exception ex) {
+      LOGGER.warn("Ignoring unreadable Study Agent source context for session {}", sessionId);
+      return Map.of();
+    }
   }
 
   private void writeInTransaction(Runnable work) {
