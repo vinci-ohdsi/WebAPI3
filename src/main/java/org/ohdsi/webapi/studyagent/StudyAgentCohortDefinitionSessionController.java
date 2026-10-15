@@ -34,6 +34,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 @RestController
 @RequestMapping("/study-agent/v1/cohort-definition-sessions")
 public class StudyAgentCohortDefinitionSessionController {
+  private static final int MAX_COHORT_DEFINITION_NAME_LENGTH = 255;
   private static final Logger LOGGER = LoggerFactory.getLogger(StudyAgentCohortDefinitionSessionController.class);
   private final JdbcTemplate jdbcTemplate;
   private final TransactionTemplate transactionTemplate;
@@ -397,15 +398,13 @@ public class StudyAgentCohortDefinitionSessionController {
     ownedSession(sessionId, null);
     Map<String, Object> specification = specificationService.findLatest(specificationTable, parseSessionId(sessionId));
     if (specification == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Study Agent cohort specification not found");
-    // Plans reviewed before projection support was introduced remain resumable.
-    // Enrich their read model without mutating the accepted historical revision.
+    // Reassess the read model under the current conservative projection
+    // contract without mutating the accepted historical review revision.
     if ("ready_for_projection".equals(string(specification.get("state")))) {
       Map<String, Object> body = objectMapper.convertValue(specification.get("specification"), LinkedHashMap.class);
-      if (!body.containsKey("projection")) {
-        body.put("projection", specificationService.assessProjection(body));
-        specification = new LinkedHashMap<>(specification);
-        specification.put("specification", body);
-      }
+      body.put("projection", specificationService.assessProjection(body));
+      specification = new LinkedHashMap<>(specification);
+      specification.put("specification", body);
     }
     return Map.of("session_id", sessionId, "cohort_specification", specification);
   }
@@ -504,6 +503,7 @@ public class StudyAgentCohortDefinitionSessionController {
     } catch (IllegalStateException ex) {
       throw new ResponseStatusException(HttpStatus.CONFLICT, ex.getMessage());
     }
+    Map<String, Object> projectionAssessment = specificationService.assessProjection(specification);
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("narrative_statement", string(session.get("narrative")));
     payload.put("confirmed_scope", true);
@@ -523,7 +523,7 @@ public class StudyAgentCohortDefinitionSessionController {
     projected.put("state", "draft_ready");
     projected.put("unresolved_decisions", List.of());
     projected.put("unsupported_constructs", List.of());
-    projected.put("projection", Map.of("supported", true, "mode", "condition_visit_overlap", "status", "emitted", "emitted_at", Instant.now().toString()));
+    projected.put("projection", Map.of("supported", true, "mode", string(projectionAssessment.get("mode")), "status", "emitted", "emitted_at", Instant.now().toString()));
     Map<String, Object> persisted = specificationService.persist(specificationTable, parsed, projected, "draft_ready", true);
     writeInTransaction(() -> updateState(parsed, "draft_ready", persisted));
     return Map.of("session_id", sessionId, "cohort_specification", persisted,
@@ -546,8 +546,9 @@ public class StudyAgentCohortDefinitionSessionController {
     }
     UUID parsed = parseSessionId(sessionId);
     String sourceType = "ai_search".equals(session.get("acquisition_route")) ? "recommendation" : "phenotype_library";
-    int revision = reviewService.persist(reviewTable, sessionTable, parsed, sourceType, cleanedId, string(definition.get("phenotype_name")), expression, definition);
-    return Map.of("session_id", sessionId, "review_revision", revision, "name", string(definition.get("phenotype_name")), "expression", expression, "expression_checksum", sha256(json(expression)));
+    String draftName = suggestedCohortDefinitionName(string(definition.get("phenotype_name")));
+    int revision = reviewService.persist(reviewTable, sessionTable, parsed, sourceType, cleanedId, draftName, expression, definition);
+    return Map.of("session_id", sessionId, "review_revision", revision, "name", draftName, "expression", expression, "expression_checksum", sha256(json(expression)));
   }
 
   @PostMapping("/{sessionId}/cohort-definition/{cohortDefinitionId}")
@@ -567,7 +568,7 @@ public class StudyAgentCohortDefinitionSessionController {
     UUID parsed = parseSessionId(sessionId);
     try {
       Map<String, Object> review = jdbcTemplate.queryForMap(("select r.revision, r.phenotype_name, r.reviewed_expression, r.expression_checksum from " + reviewTable + " r join " + sessionTable + " s on s.session_id=r.session_id where r.session_id=? and s.user_id=? and s.archived_at is null order by r.revision desc limit 1"), parsed, authorizationService.getAuthenticatedPrincipal().getUserId());
-      return Map.of("session_id", sessionId, "review_revision", review.get("revision"), "name", review.get("phenotype_name"), "expression", objectMapper.readValue(string(review.get("reviewed_expression")), Map.class), "expression_checksum", review.get("expression_checksum"));
+      return Map.of("session_id", sessionId, "review_revision", review.get("revision"), "name", suggestedCohortDefinitionName(string(review.get("phenotype_name"))), "expression", objectMapper.readValue(string(review.get("reviewed_expression")), Map.class), "expression_checksum", review.get("expression_checksum"));
     } catch (EmptyResultDataAccessException ex) {
       throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Study Agent cohort draft not found");
     } catch (Exception ex) {
@@ -576,7 +577,14 @@ public class StudyAgentCohortDefinitionSessionController {
   }
 
   private void persistComputableDraft(UUID sessionId, String narrative, Map<?, ?> expression, Map<String, Object> response) {
-    reviewService.persist(reviewTable, sessionTable, sessionId, "make_computable", null, narrative, expression, response);
+    reviewService.persist(reviewTable, sessionTable, sessionId, "make_computable", null, suggestedCohortDefinitionName(narrative), expression, response);
+  }
+
+  /** Atlas/WebAPI cohort-definition names are VARCHAR(255); retain the full narrative in provenance. */
+  private String suggestedCohortDefinitionName(String value) {
+    String name = string(value);
+    if (name.length() <= MAX_COHORT_DEFINITION_NAME_LENGTH) return name;
+    return name.substring(0, MAX_COHORT_DEFINITION_NAME_LENGTH - 3).stripTrailing() + "...";
   }
 
   private Map<String, Object> savedConceptSetSnapshot(int conceptSetId) {

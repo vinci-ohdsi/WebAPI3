@@ -349,11 +349,13 @@ public class StudyAgentCohortSpecificationService {
   }
 
   /**
-   * Conservative first multi-component projection surface. It preserves the
-   * semantics already implemented by the ACP emitter: a Condition index event
-   * with exactly one reviewed Visit restriction that overlaps the index event.
-   * Other reviewed plans remain durable review artifacts until they gain a
-   * purpose-built projection, rather than being flattened or guessed at.
+   * Conservative projection surface. It preserves the semantics already
+   * implemented by the ACP emitter: one reviewed direct Condition or Drug
+   * index; a Condition index with exactly one overlapping Visit restriction;
+   * or a Drug index with one reviewed supporting Condition in a confirmed
+   * on/before-index window. Other reviewed plans remain durable review
+   * artifacts until they gain a purpose-built projection, rather than being
+   * flattened or guessed at.
    */
   @SuppressWarnings("unchecked")
   public Map<String, Object> assessProjection(Map<String, Object> specification) {
@@ -363,15 +365,19 @@ public class StudyAgentCohortSpecificationService {
         .anyMatch(slot -> !"reviewed".equals(text(slot.get("asset_status"))))) {
       return Map.of("supported", false, "reason", "Every concept-set asset must be policy reviewed before projection.");
     }
-    if (bindings.size() != 2) {
-      return Map.of("supported", false, "reason", "This first projection supports one Condition index and one overlapping Visit restriction only.");
-    }
     Map<String, Object> primary = null;
     Map<String, Object> restriction = null;
     for (Object raw : bindings) {
       Map<String, Object> binding = mapper.convertValue(raw, LinkedHashMap.class);
       if ("primary_index".equals(text(binding.get("criterion_role")))) primary = binding;
       else restriction = binding;
+    }
+    if (bindings.size() == 1 && primary != null
+        && ("Condition".equals(text(primary.get("domain"))) || "Drug".equals(text(primary.get("domain"))))) {
+      return Map.of("supported", true, "mode", "direct_index", "summary", "One reviewed direct " + text(primary.get("domain")) + " index event.");
+    }
+    if (bindings.size() != 2) {
+      return Map.of("supported", false, "reason", "This reviewed plan needs an explicit supported projection. Currently supported: one direct Condition or Drug index; a Condition index with an overlapping Visit restriction; or a Drug index with supporting Condition evidence in a confirmed on/before-index window.");
     }
     if (primary != null && restriction != null
         && "Condition".equals(text(primary.get("domain")))
@@ -391,7 +397,7 @@ public class StudyAgentCohortSpecificationService {
         && startDays != null && endDays != null && startDays <= endDays && endDays <= 0) {
       return Map.of("supported", true, "mode", "drug_supporting_condition", "summary", "Drug index event with reviewed supporting Condition evidence in the confirmed pre-index window.");
     }
-    return Map.of("supported", false, "reason", "This reviewed plan needs an explicit supported projection. Currently supported: a Condition index with an overlapping Visit restriction, or a Drug index with supporting Condition evidence in a confirmed on/before-index window.");
+    return Map.of("supported", false, "reason", "This reviewed plan needs an explicit supported projection. Currently supported: one direct Condition or Drug index; a Condition index with an overlapping Visit restriction; or a Drug index with supporting Condition evidence in a confirmed on/before-index window.");
   }
 
   /** Builds the exact typed ACP request from accepted snapshots; browser data is never reused. */
