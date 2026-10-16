@@ -34,7 +34,7 @@ public class StudyAgentCohortDefinitionReviewService {
   public Map<String, Object> findOwnedProvenance(String reviewTable, String sessionTable, Integer cohortDefinitionId, Long userId) {
     try {
       return jdbc.queryForMap(
-          "select r.revision, r.source_type, r.phenotype_id, r.phenotype_name, r.computability_status, "
+          "select r.session_id, r.revision, r.source_type, r.phenotype_id, r.phenotype_name, r.computability_status, "
               + "r.expression_checksum, r.reviewed_expression, d.expression as current_expression, "
               + "r.created_at, r.approved_at, s.acquisition_route, s.narrative "
               + "from " + reviewTable + " r join " + sessionTable + " s on s.session_id=r.session_id "

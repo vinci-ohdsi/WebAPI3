@@ -262,6 +262,39 @@ public class StudyAgentCohortDefinitionSessionController {
   }
 
   /**
+   * Returns bounded source evidence for clinical review. This does not select
+   * concepts, alter a cohort scope, create a draft, or invoke conversion.
+   */
+  @PostMapping("/{sessionId}/phenotypes/{phenotypeId}/evidence")
+  @PreAuthorize("isPermitted('study-agent:cohort-definition-assist')")
+  public Map<String, Object> phenotypeEvidence(
+      @PathVariable String sessionId, @PathVariable String phenotypeId,
+      @RequestBody(required = false) Map<String, Object> request) {
+    ownedSession(sessionId, null);
+    String cleanedId = string(phenotypeId);
+    if (cleanedId.isEmpty() || cleanedId.length() > 256) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid phenotype identifier");
+    }
+    Map<String, Object> context = request == null ? Map.of() : map(request.get("recommendation_context"));
+    if (json(context).length() > 4000) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "phenotype evidence context is too large");
+    }
+    Map<String, Object> response = acpClient.post("/flows/phenotype_definition", Map.of(
+        "phenotype_id", cleanedId,
+        "allow_make_computable", false,
+        "recommendation_context", context));
+    Map<String, Object> evidence = map(response.get("review_evidence"));
+    if (evidence.isEmpty()) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "Source phenotype evidence is unavailable");
+    }
+    return Map.of(
+        "session_id", sessionId,
+        "review_only", true,
+        "phenotype_status", string(response.get("status")),
+        "evidence", evidence);
+  }
+
+  /**
    * Returns contextual, advisory-only guidance while a cohort is being authored.
    * It cannot alter the session, scope, concept policy, or Atlas cohort draft.
    */

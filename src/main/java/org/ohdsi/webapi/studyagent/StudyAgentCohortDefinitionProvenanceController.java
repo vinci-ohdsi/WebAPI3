@@ -70,6 +70,7 @@ public class StudyAgentCohortDefinitionProvenanceController {
     result.put("linked", true);
     result.put("review_revision", row.get("revision"));
     result.put("source_type", row.get("source_type"));
+    result.put("session_id", String.valueOf(row.get("session_id")));
     result.put("acquisition_route", row.get("acquisition_route"));
     result.put("phenotype_id", row.get("phenotype_id"));
     result.put("phenotype_name", row.get("phenotype_name"));
